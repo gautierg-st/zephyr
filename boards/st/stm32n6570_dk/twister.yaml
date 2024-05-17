@@ -8,6 +8,7 @@ supported:
   - arduino_serial
   - dma
   - gpio
+  - memc
   - uart
 variants:
   stm32n6570_dk/stm32n657xx:
