@@ -1457,14 +1457,12 @@ static int spi_stm32_configure(const struct device *dev,
 
 	/* configure the frame format Motorola (default) or TI */
 	if ((config->operation & SPI_FRAME_FORMAT_TI) == SPI_FRAME_FORMAT_TI) {
-#ifdef LL_SPI_PROTOCOL_TI
-		LL_SPI_SetStandard(spi, LL_SPI_PROTOCOL_TI);
-#else
+#ifndef LL_SPI_PROTOCOL_TI
 		LOG_ERR("Frame Format TI not supported");
 		/* on stm32F1 or some stm32L1 (cat1,2) without SPI_CR2_FRF */
 		return -ENOTSUP;
-#endif
-#if defined(LL_SPI_PROTOCOL_MOTOROLA) && defined(SPI_CR2_FRF)
+#else
+		LL_SPI_SetStandard(spi, LL_SPI_PROTOCOL_TI);
 	} else {
 		LL_SPI_SetStandard(spi, LL_SPI_PROTOCOL_MOTOROLA);
 #endif
