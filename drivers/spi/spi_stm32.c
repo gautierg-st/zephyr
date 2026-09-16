@@ -589,12 +589,25 @@ static inline bool spi_stm32_fifo_tx_can_pack(struct spi_stm32_data *data)
 static inline uint8_t spi_stm32_fifo_pack(struct spi_stm32_data *data, bool can_pack)
 {
 #if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
-	uint8_t dfs = bits2bytes(data->ctx.config->operation);
-
-	return (dfs == 1U && can_pack) ? 2U : 1U;
+	return (data->dfs == 1U && can_pack) ? 2U : 1U;
 #else
 	ARG_UNUSED(data);
 	ARG_UNUSED(can_pack);
+	return 0U;
+#endif
+}
+
+/* Read back the currently armed FRXTH threshold instead of recomputing
+ * tx_can_pack()/rx_can_pack(): the previous spi_stm32_fifo_rx_set_threshold()
+ * call already armed it to match exactly what this Rx access must do, and
+ * RXNE only fires once the FIFO actually holds that many bytes.
+ */
+static inline uint8_t spi_stm32_fifo_armed_rx_pack(SPI_TypeDef *spi)
+{
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	return (LL_SPI_GetRxFIFOThreshold(spi) == LL_SPI_RX_FIFO_TH_HALF) ? 2U : 1U;
+#else
+	ARG_UNUSED(spi);
 	return 0U;
 #endif
 }
@@ -621,7 +634,7 @@ static inline void spi_stm32_fifo_rx_set_threshold(SPI_TypeDef *spi, struct spi_
 static uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi, struct spi_stm32_data *data,
 					 uint8_t fifo_space)
 {
-	const uint8_t dfs = bits2bytes(data->ctx.config->operation);
+	const uint8_t dfs = data->dfs;
 	uint32_t tx_frame = SPI_STM32_TX_NOP;
 	uint8_t len;
 
@@ -671,7 +684,7 @@ static uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi, struct spi_stm32_data
 static uint8_t spi_stm32_read_next_frame(SPI_TypeDef *spi, struct spi_stm32_data *data,
 					 uint8_t fifo_space)
 {
-	const uint8_t dfs = bits2bytes(data->ctx.config->operation);
+	const uint8_t dfs = data->dfs;
 	uint32_t rx_frame = 0;
 	uint8_t len;
 
@@ -834,26 +847,25 @@ static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *dat
 			 * after reading, based on the just-updated remaining count.
 			 */
 			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
-				uint8_t rd_pack = spi_stm32_fifo_pack(data,
-						spi_stm32_fifo_tx_can_pack(data) &&
-						spi_stm32_fifo_rx_can_pack(data));
+				data->rx_len -= spi_stm32_read_next_frame(spi, data,
+						spi_stm32_fifo_armed_rx_pack(spi));
 
-				data->rx_len -= spi_stm32_read_next_frame(spi, data, rd_pack);
 				if (data->tx_len != 0U) {
-					/* Recompute for the send: the read above may have
-					 * just crossed an Rx buffer chunk boundary, which
-					 * changes what rx_can_pack() reports and must not
-					 * be decided using the pre-read (now stale) value.
-					 */
-					uint8_t wr_pack = spi_stm32_fifo_pack(data,
-							spi_stm32_fifo_tx_can_pack(data) &&
-							spi_stm32_fifo_rx_can_pack(data));
+					bool tx_can_pack = spi_stm32_fifo_tx_can_pack(data);
+					bool rx_can_pack = spi_stm32_fifo_rx_can_pack(data);
 
-					data->tx_len -= spi_stm32_send_next_frame(spi, data,
-										  wr_pack);
+					/* This same send is the only thing that can produce
+					 * more Rx bytes before the next event, so arming the
+					 * threshold with the exact pack decision that gates
+					 * the send below (no recompute needed afterwards)
+					 * tells us exactly how many bytes will arrive.
+					 */
 					spi_stm32_fifo_rx_set_threshold(spi, data,
-							spi_stm32_fifo_tx_can_pack(data) &&
-							spi_stm32_fifo_rx_can_pack(data));
+							tx_can_pack && rx_can_pack);
+					data->tx_len -= spi_stm32_send_next_frame(spi, data,
+							spi_stm32_fifo_pack(data,
+									     tx_can_pack &&
+									     rx_can_pack));
 				} else {
 					spi_stm32_fifo_rx_set_threshold(spi, data,
 							spi_stm32_fifo_rx_can_pack(data));
@@ -873,10 +885,8 @@ static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *dat
 		} else if (dir == STM32_SPI_HALF_DUPLEX_RX) {
 			/* Half-duplex RX: RXNE flag-based handling. */
 			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
-				uint8_t pack = spi_stm32_fifo_pack(data,
-						spi_stm32_fifo_rx_can_pack(data));
-
-				data->rx_len -= spi_stm32_read_next_frame(spi, data, pack);
+				data->rx_len -= spi_stm32_read_next_frame(spi, data,
+						spi_stm32_fifo_armed_rx_pack(spi));
 				spi_stm32_fifo_rx_set_threshold(spi, data,
 						spi_stm32_fifo_rx_can_pack(data));
 			}
@@ -888,46 +898,57 @@ static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *dat
 		/* Polling case: read before send. With a real FIFO, sending first
 		 * could fill it up and stall on room while Rx data already sitting
 		 * in the Rx FIFO never gets drained; draining Rx first avoids that.
-		 * Full duplex packs both sides from the same jointly-decided pack,
-		 * for the same reason as the IT path above.
+		 * The Rx access width is read back from the already-armed FRXTH
+		 * threshold (see spi_stm32_fifo_armed_rx_pack); Tx and the next
+		 * threshold still need tx_can_pack/rx_can_pack, cached and only
+		 * refreshed where a preceding read or send could change them.
 		 */
-		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
-			bool can_pack = (dir == STM32_SPI_FULL_DUPLEX)
-					? spi_stm32_fifo_tx_can_pack(data) &&
-					  spi_stm32_fifo_rx_can_pack(data)
-					: spi_stm32_fifo_rx_can_pack(data);
+		bool tx_can_pack = false;
+		bool rx_can_pack = false;
 
+		if (dir == STM32_SPI_FULL_DUPLEX) {
+			tx_can_pack = spi_stm32_fifo_tx_can_pack(data);
+		}
+
+		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
 			while (!ll_rx_is_not_empty(spi)) {
 				/* NOP */
 			}
 			data->rx_len -= spi_stm32_read_next_frame(spi, data,
-						spi_stm32_fifo_pack(data, can_pack));
+					spi_stm32_fifo_armed_rx_pack(spi));
+
+			if (dir == STM32_SPI_FULL_DUPLEX) {
+				rx_can_pack = spi_stm32_fifo_rx_can_pack(data);
+			}
 		}
 
 		if (dir != STM32_SPI_HALF_DUPLEX_RX && data->tx_len != 0U) {
-			bool can_pack = (dir == STM32_SPI_FULL_DUPLEX)
-					? spi_stm32_fifo_tx_can_pack(data) &&
-					  spi_stm32_fifo_rx_can_pack(data)
-					: spi_stm32_fifo_tx_can_pack(data);
+			if (dir != STM32_SPI_FULL_DUPLEX) {
+				tx_can_pack = spi_stm32_fifo_tx_can_pack(data);
+			}
 
 			while (!ll_tx_is_not_full(spi)) {
 				/* NOP */
 			}
 			data->tx_len -= spi_stm32_send_next_frame(spi, data,
-						spi_stm32_fifo_pack(data, can_pack));
+					spi_stm32_fifo_pack(data, dir == STM32_SPI_FULL_DUPLEX
+								   ? tx_can_pack && rx_can_pack
+								   : tx_can_pack));
 		}
 
 		/* Arm the threshold only now, once Tx has also been decremented: doing
 		 * it right after the Rx read would use a not-yet-updated ctx.tx_len and
 		 * could arm a stale (too permissive) threshold once Tx crosses the pack
-		 * boundary within this same call, leaving Rx data stuck undrained.
+		 * boundary within this same call, leaving Rx data stuck undrained. The
+		 * cached tx_can_pack/rx_can_pack (not recomputed after the send) already
+		 * describe exactly what that send just produced, which is the only thing
+		 * that can generate more Rx bytes before the next event.
 		 */
 		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
 			spi_stm32_fifo_rx_set_threshold(spi, data,
-					(dir == STM32_SPI_FULL_DUPLEX)
-						? spi_stm32_fifo_tx_can_pack(data) &&
-						  spi_stm32_fifo_rx_can_pack(data)
-						: spi_stm32_fifo_rx_can_pack(data));
+					dir == STM32_SPI_FULL_DUPLEX
+						? tx_can_pack && rx_can_pack
+						: rx_can_pack);
 		}
 	} /* CONFIG_SPI_STM32_INTERRUPT */
 
@@ -1034,9 +1055,8 @@ static void spi_stm32_shift_s(SPI_TypeDef *spi, struct spi_stm32_data *data)
 	}
 
 	if (dir != STM32_SPI_HALF_DUPLEX_TX && ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
-		uint8_t pack = spi_stm32_fifo_pack(data, spi_stm32_fifo_rx_can_pack(data));
-
-		data->rx_len -= spi_stm32_read_next_frame(spi, data, pack);
+		data->rx_len -= spi_stm32_read_next_frame(spi, data,
+				spi_stm32_fifo_armed_rx_pack(spi));
 		spi_stm32_fifo_rx_set_threshold(spi, data, spi_stm32_fifo_rx_can_pack(data));
 	}
 }
@@ -1842,6 +1862,7 @@ static int spi_stm32_configure(const struct device *dev,
 
 	/* At this point, it's mandatory to set this on the context! */
 	data->ctx.config = config;
+	data->dfs = bits2bytes(config->operation);
 
 	LOG_DBG("Installed config %p: freq %uHz (div = %u), mode %u/%u/%u, peripheral %u",
 		config, clock >> br, 1 << br,
