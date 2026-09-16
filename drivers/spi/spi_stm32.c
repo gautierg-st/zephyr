@@ -559,6 +559,42 @@ static void spi_stm32_dma_rx_done(const struct device *dev, const struct spi_con
 /* Value to shift out when no application data needs transmitting. */
 #define SPI_STM32_TX_NOP 0x00
 
+/* Whether the next Tx/Rx access can pack 2 frames into a single 16-bit DR access:
+ * only possible for <=8-bit frames, on classic (non st_stm32h7_spi) FIFO series,
+ * and while at least 2 frames remain (a lone trailing frame never packs).
+ */
+static inline uint8_t spi_stm32_fifo_pack(struct spi_stm32_data *data, uint32_t remaining)
+{
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	uint8_t dfs = bits2bytes(data->ctx.config->operation);
+
+	return (dfs == 1U && remaining >= 2U) ? 2U : 1U;
+#else
+	ARG_UNUSED(data);
+	ARG_UNUSED(remaining);
+	return 0U;
+#endif
+}
+
+/* Keep FRXTH matched to the remaining Rx frame count: half-word threshold while
+ * packing 2 frames, back to its 1-byte reset value for a lone trailing frame so
+ * RXNE still fires on it. Must be called before waiting on the Rx event that the
+ * threshold being set here is meant to gate.
+ */
+static inline void spi_stm32_fifo_rx_set_threshold(SPI_TypeDef *spi, struct spi_stm32_data *data,
+						    uint32_t remaining)
+{
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	LL_SPI_SetRxFIFOThreshold(spi, (spi_stm32_fifo_pack(data, remaining) == 2U)
+					       ? LL_SPI_RX_FIFO_TH_HALF
+					       : LL_SPI_RX_FIFO_TH_QUARTER);
+#else
+	ARG_UNUSED(spi);
+	ARG_UNUSED(data);
+	ARG_UNUSED(remaining);
+#endif
+}
+
 static uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi, struct spi_stm32_data *data,
 					 uint8_t fifo_space)
 {
@@ -754,16 +790,28 @@ static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
 	if (IS_ENABLED(CONFIG_SPI_STM32_INTERRUPT)) {
 		if (dir == STM32_SPI_FULL_DUPLEX) {
 			/* RXNE-driven: TXE interrupt is not enabled for this path.
-			 * Read the received frame, then queue the next TX frame to keep
-			 * the one-frame pipeline full.
-			 * After the last TX frame, re-enable TXE so the trailing TXE ISR
-			 * provides a guaranteed exit point once BSY has cleared.
+			 * Read the received frame(s), then requeue the same amount of TX
+			 * frames to keep the FIFOs' content matched to what remains.
+			 * Both sides pack using the *same*, jointly-bounded remaining
+			 * count (ctx.tx_len/ctx.rx_len, not data->tx_len/rx_len): a null
+			 * Tx or Rx buf set only tracks frame count, not real data, and
+			 * leaves the corresponding ctx length at 0, so bounding by the
+			 * pair keeps FRXTH and the actual access width matched.
+			 * The Rx FIFO threshold is re-armed for the *next* Rx event right
+			 * after reading, based on the just-updated remaining count.
 			 */
 			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
-				data->rx_len -= spi_stm32_read_next_frame(spi, data, 0U);
+				uint8_t pack = spi_stm32_fifo_pack(data,
+						MIN(data->ctx.tx_len, data->ctx.rx_len));
+
+				data->rx_len -= spi_stm32_read_next_frame(spi, data, pack);
 				if (data->tx_len != 0U) {
-					data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+					data->tx_len -= spi_stm32_send_next_frame(spi, data, pack);
+					spi_stm32_fifo_rx_set_threshold(spi, data,
+						MIN(data->ctx.tx_len, data->ctx.rx_len));
 				} else {
+					spi_stm32_fifo_rx_set_threshold(spi, data,
+									 data->ctx.rx_len);
 					/* All TX done; request one trailing TXE interrupt
 					 * to exit cleanly once BSY is cleared.
 					 */
@@ -773,31 +821,62 @@ static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
 		} else if (dir == STM32_SPI_HALF_DUPLEX_TX) {
 			/* Half-duplex TX: TXE flag-based handling. */
 			if (ll_tx_is_not_full(spi) && data->tx_len != 0U) {
-				data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+				data->tx_len -= spi_stm32_send_next_frame(spi, data,
+						spi_stm32_fifo_pack(data, data->ctx.tx_len));
 			}
 		} else if (dir == STM32_SPI_HALF_DUPLEX_RX) {
 			/* Half-duplex RX: RXNE flag-based handling. */
 			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
-				data->rx_len -= spi_stm32_read_next_frame(spi, data, 0U);
+				uint8_t pack = spi_stm32_fifo_pack(data, data->ctx.rx_len);
+
+				data->rx_len -= spi_stm32_read_next_frame(spi, data, pack);
+				spi_stm32_fifo_rx_set_threshold(spi, data, data->ctx.rx_len);
 			}
 		} else {
 			/* Unexpected transfer direction */
 			return -EINVAL;
 		}
 	} else { /* CONFIG_SPI_STM32_INTERRUPT */
-		/* Polling case */
-		if (dir != STM32_SPI_HALF_DUPLEX_RX && data->tx_len != 0U) {
-			while (!ll_tx_is_not_full(spi)) {
-				/* NOP */
-			}
-			data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
-		}
-
+		/* Polling case: read before send (mirrors the H7 DXP handling, see
+		 * spi_stm32_shift_fifo) so Rx is always drained first and never
+		 * starves behind a busy-wait on Tx room. Full duplex packs both sides
+		 * from the same jointly-bounded remaining count, for the same reason
+		 * as the IT path above.
+		 */
 		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
+			uint32_t remaining = (dir == STM32_SPI_FULL_DUPLEX)
+					? MIN(data->ctx.tx_len, data->ctx.rx_len)
+					: data->ctx.rx_len;
+
 			while (!ll_rx_is_not_empty(spi)) {
 				/* NOP */
 			}
-			data->rx_len -= spi_stm32_read_next_frame(spi, data, 0U);
+			data->rx_len -= spi_stm32_read_next_frame(spi, data,
+						spi_stm32_fifo_pack(data, remaining));
+		}
+
+		if (dir != STM32_SPI_HALF_DUPLEX_RX && data->tx_len != 0U) {
+			uint32_t remaining = (dir == STM32_SPI_FULL_DUPLEX)
+					? MIN(data->ctx.tx_len, data->ctx.rx_len)
+					: data->ctx.tx_len;
+
+			while (!ll_tx_is_not_full(spi)) {
+				/* NOP */
+			}
+			data->tx_len -= spi_stm32_send_next_frame(spi, data,
+						spi_stm32_fifo_pack(data, remaining));
+		}
+
+		/* Arm the threshold only now, once Tx has also been decremented: doing
+		 * it right after the Rx read would use a not-yet-updated ctx.tx_len and
+		 * could arm a stale (too permissive) threshold once Tx crosses the pack
+		 * boundary within this same call, leaving Rx data stuck undrained.
+		 */
+		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
+			spi_stm32_fifo_rx_set_threshold(spi, data,
+					(dir == STM32_SPI_FULL_DUPLEX)
+						? MIN(data->ctx.tx_len, data->ctx.rx_len)
+						: data->ctx.rx_len);
 		}
 	} /* CONFIG_SPI_STM32_INTERRUPT */
 
@@ -818,13 +897,18 @@ static void spi_stm32_shift_s(SPI_TypeDef *spi, struct spi_stm32_data *data)
 	uint32_t dir = ll_get_transfer_direction(spi);
 
 	if (dir != STM32_SPI_HALF_DUPLEX_RX && ll_tx_is_not_full(spi) && data->tx_len != 0U) {
-		data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+		data->tx_len -= spi_stm32_send_next_frame(spi, data,
+							   spi_stm32_fifo_pack(data,
+									       data->ctx.tx_len));
 	} else {
 		ll_disable_int_tx_empty(spi);
 	}
 
 	if (dir != STM32_SPI_HALF_DUPLEX_TX && ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
-		data->rx_len -= spi_stm32_read_next_frame(spi, data, 0U);
+		uint8_t pack = spi_stm32_fifo_pack(data, data->ctx.rx_len);
+
+		data->rx_len -= spi_stm32_read_next_frame(spi, data, pack);
+		spi_stm32_fifo_rx_set_threshold(spi, data, data->ctx.rx_len);
 	}
 }
 
@@ -926,16 +1010,26 @@ static void spi_stm32_msg_start(const struct device *dev, bool is_rx_empty)
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
 			} else {
 				/* Non-H7 or H7 without FIFO full-duplex:
-				 * Seed the TX pipeline with the first frame and enable RXNE only.
-				 * Each RXNE ISR reads one received frame then sends the next,
-				 * keeping exactly one frame in flight.
-				 * This eliminates RX overrun without busy-waiting in ISR context.
+				 * Seed the TX pipeline, then arm the Rx FIFO threshold for the
+				 * first Rx event and enable RXNE only. Each RXNE ISR reads what
+				 * came back and requeues the same amount (see spi_stm32_shift_m).
+				 * The threshold is armed *after* the send so it reflects the
+				 * post-decrement ctx.tx_len, matching what the first real Rx
+				 * event will see.
 				 */
-				data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+				uint32_t remaining = MIN(data->ctx.tx_len, data->ctx.rx_len);
+
+				data->tx_len -= spi_stm32_send_next_frame(spi, data,
+						spi_stm32_fifo_pack(data, remaining));
+				spi_stm32_fifo_rx_set_threshold(spi, data,
+						MIN(data->ctx.tx_len, data->ctx.rx_len));
 				ll_enable_int_rx_not_empty(spi);
 			}
 		} else {
+			struct spi_stm32_data *data = dev->data;
+
 			if (transfer_dir != STM32_SPI_HALF_DUPLEX_TX) {
+				spi_stm32_fifo_rx_set_threshold(spi, data, data->ctx.rx_len);
 				ll_enable_int_rx_not_empty(spi);
 			}
 
@@ -962,6 +1056,21 @@ static void spi_stm32_msg_start(const struct device *dev, bool is_rx_empty)
 			struct spi_stm32_data *data = dev->data;
 
 			spi_stm32_send_fifo(spi, data);
+		}
+#elif DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo)
+		if (transfer_dir == STM32_SPI_FULL_DUPLEX && LL_SPI_GetMode(spi) == LL_SPI_MODE_MASTER) {
+			/* Polling mode: seed the TX pipeline so the shift_m loop can read
+			 * before it sends on its very first iteration, then arm the Rx
+			 * threshold using the post-decrement ctx.tx_len (see the IT seed
+			 * above for why the ordering matters).
+			 */
+			struct spi_stm32_data *data = dev->data;
+			uint32_t remaining = MIN(data->ctx.tx_len, data->ctx.rx_len);
+
+			data->tx_len -= spi_stm32_send_next_frame(spi, data,
+					spi_stm32_fifo_pack(data, remaining));
+			spi_stm32_fifo_rx_set_threshold(spi, data,
+					MIN(data->ctx.tx_len, data->ctx.rx_len));
 		}
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
 	}
