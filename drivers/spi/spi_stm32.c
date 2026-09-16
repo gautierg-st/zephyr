@@ -597,17 +597,17 @@ static inline uint8_t spi_stm32_fifo_pack(struct spi_stm32_data *data, bool can_
 #endif
 }
 
-/* Read back the currently armed FRXTH threshold instead of recomputing
- * tx_can_pack()/rx_can_pack(): the previous spi_stm32_fifo_rx_set_threshold()
- * call already armed it to match exactly what this Rx access must do, and
- * RXNE only fires once the FIFO actually holds that many bytes.
+/* Return the Rx pack width matching the currently armed FRXTH, cached in
+ * data->armed_rx_pack by spi_stm32_fifo_rx_set_threshold(): cheaper than a
+ * register read, and RXNE only fires once the FIFO actually holds that many
+ * bytes, so the cached value is always accurate when this is called.
  */
-static inline uint8_t spi_stm32_fifo_armed_rx_pack(SPI_TypeDef *spi)
+static inline uint8_t spi_stm32_fifo_armed_rx_pack(struct spi_stm32_data *data)
 {
 #if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
-	return (LL_SPI_GetRxFIFOThreshold(spi) == LL_SPI_RX_FIFO_TH_HALF) ? 2U : 1U;
+	return data->armed_rx_pack;
 #else
-	ARG_UNUSED(spi);
+	ARG_UNUSED(data);
 	return 0U;
 #endif
 }
@@ -621,7 +621,8 @@ static inline void spi_stm32_fifo_rx_set_threshold(SPI_TypeDef *spi, struct spi_
 						    bool can_pack)
 {
 #if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
-	LL_SPI_SetRxFIFOThreshold(spi, (spi_stm32_fifo_pack(data, can_pack) == 2U)
+	data->armed_rx_pack = spi_stm32_fifo_pack(data, can_pack);
+	LL_SPI_SetRxFIFOThreshold(spi, (data->armed_rx_pack == 2U)
 					       ? LL_SPI_RX_FIFO_TH_HALF
 					       : LL_SPI_RX_FIFO_TH_QUARTER);
 #else
@@ -848,7 +849,7 @@ static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *dat
 			 */
 			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
 				data->rx_len -= spi_stm32_read_next_frame(spi, data,
-						spi_stm32_fifo_armed_rx_pack(spi));
+						spi_stm32_fifo_armed_rx_pack(data));
 
 				if (data->tx_len != 0U) {
 					bool tx_can_pack = spi_stm32_fifo_tx_can_pack(data);
@@ -886,7 +887,7 @@ static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *dat
 			/* Half-duplex RX: RXNE flag-based handling. */
 			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
 				data->rx_len -= spi_stm32_read_next_frame(spi, data,
-						spi_stm32_fifo_armed_rx_pack(spi));
+						spi_stm32_fifo_armed_rx_pack(data));
 				spi_stm32_fifo_rx_set_threshold(spi, data,
 						spi_stm32_fifo_rx_can_pack(data));
 			}
@@ -915,7 +916,7 @@ static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *dat
 				/* NOP */
 			}
 			data->rx_len -= spi_stm32_read_next_frame(spi, data,
-					spi_stm32_fifo_armed_rx_pack(spi));
+					spi_stm32_fifo_armed_rx_pack(data));
 
 			if (dir == STM32_SPI_FULL_DUPLEX) {
 				rx_can_pack = spi_stm32_fifo_rx_can_pack(data);
@@ -1056,7 +1057,7 @@ static void spi_stm32_shift_s(SPI_TypeDef *spi, struct spi_stm32_data *data)
 
 	if (dir != STM32_SPI_HALF_DUPLEX_TX && ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
 		data->rx_len -= spi_stm32_read_next_frame(spi, data,
-				spi_stm32_fifo_armed_rx_pack(spi));
+				spi_stm32_fifo_armed_rx_pack(data));
 		spi_stm32_fifo_rx_set_threshold(spi, data, spi_stm32_fifo_rx_can_pack(data));
 	}
 }
@@ -1855,6 +1856,7 @@ static int spi_stm32_configure(const struct device *dev,
 	LL_SPI_SetFIFOThreshold(spi, table_fifo_threshold[data->fifo_threshold - 1]);
 #elif DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo)
 	data->fifo_threshold = 1;
+	data->armed_rx_pack = 1U;
 	LL_SPI_SetRxFIFOThreshold(spi, LL_SPI_RX_FIFO_TH_QUARTER);
 #else
 	data->fifo_threshold = 1;

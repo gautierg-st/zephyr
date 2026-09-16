@@ -77,6 +77,7 @@ struct spi_stm32_data {
 	uint32_t rx_len;
 	uint8_t fifo_threshold; /* Threshold value (in number of data frames) */
 	uint8_t dfs; /* Bytes per frame, cached from ctx.config->operation at configure time */
+	uint8_t armed_rx_pack; /* Rx pack width matching the currently armed FRXTH */
 #ifdef CONFIG_SPI_STM32_DMA
 	struct k_sem status_sem;
 	volatile uint32_t status_flags;
