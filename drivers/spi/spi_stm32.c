@@ -813,16 +813,13 @@ static int spi_stm32_shift_fifo(SPI_TypeDef *spi, struct spi_stm32_data *data)
 }
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
 
-/* Shift a SPI frame as controller. */
-static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+/* Classic FIFO series (FRXTH-threshold-driven, software-tracked packing).
+ * Only ever called with ll_get_transfer_size(spi) == 0 (no TSIZE on this
+ * series), so every access here goes through the FRXTH/RXNE machinery below.
+ */
+static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *data)
 {
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
-	if (ll_get_transfer_size(spi) > 0U) {
-		/* Transfer size is set, use FIFO mode. */
-		return spi_stm32_shift_fifo(spi, data);
-	}
-#endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
-
 	uint32_t dir = ll_get_transfer_direction(spi);
 
 	if (IS_ENABLED(CONFIG_SPI_STM32_INTERRUPT)) {
@@ -888,11 +885,11 @@ static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
 			return -EINVAL;
 		}
 	} else { /* CONFIG_SPI_STM32_INTERRUPT */
-		/* Polling case: read before send (mirrors the H7 DXP handling, see
-		 * spi_stm32_shift_fifo) so Rx is always drained first and never
-		 * starves behind a busy-wait on Tx room. Full duplex packs both sides
-		 * from the same jointly-decided pack, for the same reason as the IT
-		 * path above.
+		/* Polling case: read before send. With a real FIFO, sending first
+		 * could fill it up and stall on room while Rx data already sitting
+		 * in the Rx FIFO never gets drained; draining Rx first avoids that.
+		 * Full duplex packs both sides from the same jointly-decided pack,
+		 * for the same reason as the IT path above.
 		 */
 		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
 			bool can_pack = (dir == STM32_SPI_FULL_DUPLEX)
@@ -935,6 +932,85 @@ static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
 	} /* CONFIG_SPI_STM32_INTERRUPT */
 
 	return 0;
+}
+#else
+/* No FIFO on this series, or H7 falling back to its TSIZE == 0, no-FIFO
+ * software path for oversized buffers: always a single frame (or one native
+ * 16-bit word) per access, no packing, no FIFO threshold to manage.
+ */
+static int spi_stm32_shift_m_plain(SPI_TypeDef *spi, struct spi_stm32_data *data)
+{
+	uint32_t dir = ll_get_transfer_direction(spi);
+
+	if (IS_ENABLED(CONFIG_SPI_STM32_INTERRUPT)) {
+		if (dir == STM32_SPI_FULL_DUPLEX) {
+			/* RXNE-driven, seeded by one Tx frame in spi_stm32_msg_start:
+			 * read what came back, then requeue a single matching frame.
+			 */
+			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
+				data->rx_len -= spi_stm32_read_next_frame(spi, data, 1U);
+				if (data->tx_len != 0U) {
+					data->tx_len -= spi_stm32_send_next_frame(spi, data, 1U);
+				} else {
+					/* All TX done; request one trailing TXE interrupt
+					 * to exit cleanly once BSY is cleared.
+					 */
+					ll_enable_int_tx_empty(spi);
+				}
+			}
+		} else if (dir == STM32_SPI_HALF_DUPLEX_TX) {
+			if (ll_tx_is_not_full(spi) && data->tx_len != 0U) {
+				data->tx_len -= spi_stm32_send_next_frame(spi, data, 1U);
+			}
+		} else if (dir == STM32_SPI_HALF_DUPLEX_RX) {
+			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
+				data->rx_len -= spi_stm32_read_next_frame(spi, data, 1U);
+			}
+		} else {
+			/* Unexpected transfer direction */
+			return -EINVAL;
+		}
+	} else { /* CONFIG_SPI_STM32_INTERRUPT */
+		/* Polling case: send before read. There is no FIFO to overrun, and
+		 * sending first is what primes the clock for the very first frame
+		 * (no seed is done for this path in spi_stm32_msg_start).
+		 */
+		if (dir != STM32_SPI_HALF_DUPLEX_RX && data->tx_len != 0U) {
+			while (!ll_tx_is_not_full(spi)) {
+				/* NOP */
+			}
+			data->tx_len -= spi_stm32_send_next_frame(spi, data, 1U);
+		}
+
+		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
+			while (!ll_rx_is_not_empty(spi)) {
+				/* NOP */
+			}
+			data->rx_len -= spi_stm32_read_next_frame(spi, data, 1U);
+		}
+	} /* CONFIG_SPI_STM32_INTERRUPT */
+
+	return 0;
+}
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
+
+/* Shift a SPI frame as controller: dispatches to the implementation matching
+ * this instance's FIFO capability, decided once at compile time.
+ */
+static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
+{
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	if (ll_get_transfer_size(spi) > 0U) {
+		/* Transfer size is set, use FIFO mode. */
+		return spi_stm32_shift_fifo(spi, data);
+	}
+#endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
+
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	return spi_stm32_shift_m_packed(spi, data);
+#else
+	return spi_stm32_shift_m_plain(spi, data);
+#endif
 }
 
 /* Shift a SPI frame as peripheral. */
