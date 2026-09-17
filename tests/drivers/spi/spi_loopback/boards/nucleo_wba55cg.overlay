@@ -4,15 +4,31 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+&pll1 {
+	clocks = <&clk_hse>;
+	div-m = <2>;
+	mul-n = <12>;
+	div-p = <2>;
+	div-q = <2>;
+	div-r = <2>;
+	status = "okay";
+};
+
 &rcc {
-	apb2-prescaler = <2>;
+	clocks = <&pll1>;
+	clock-frequency = <DT_FREQ_M(100)>;
+	ahb-prescaler = <1>;
+	ahb5-prescaler = <4>;
+	apb1-prescaler = <1>;
+	apb2-prescaler = <1>;
+	apb7-prescaler = <1>;
 };
 
 &spi1 {
 	dmas = <&gpdma1 0 2 STM32_DMA_PERIPH_TX>,
 	       <&gpdma1 1 1 STM32_DMA_PERIPH_RX>;
 	dma-names = "tx", "rx";
-	st,fifo-threshold = <8>;
+	st,fifo-threshold = <16>;
 
 	slow@0 {
 		compatible = "test-spi-loopback-slow";
