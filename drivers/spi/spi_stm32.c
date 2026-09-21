@@ -588,9 +588,10 @@ static inline bool spi_stm32_fifo_tx_can_pack(struct spi_stm32_data *data)
  */
 static inline uint8_t spi_stm32_fifo_pack(struct spi_stm32_data *data, bool can_pack)
 {
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) && \
-	!defined(CONFIG_SPI_RTIO)
-	return (data->dfs == 1U && can_pack) ? 2U : 1U;
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	return ((!IS_ENABLED(CONFIG_SPI_RTIO) || data->fifo_packing) && data->dfs == 1U && can_pack)
+		       ? 2U
+		       : 1U;
 #else
 	ARG_UNUSED(data);
 	ARG_UNUSED(can_pack);
@@ -605,9 +606,8 @@ static inline uint8_t spi_stm32_fifo_pack(struct spi_stm32_data *data, bool can_
  */
 static inline uint8_t spi_stm32_fifo_armed_rx_pack(struct spi_stm32_data *data)
 {
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) && \
-	!defined(CONFIG_SPI_RTIO)
-	return data->armed_rx_pack;
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	return (!IS_ENABLED(CONFIG_SPI_RTIO) || data->fifo_packing) ? data->armed_rx_pack : 1U;
 #else
 	ARG_UNUSED(data);
 	return 0U;
@@ -622,12 +622,13 @@ static inline uint8_t spi_stm32_fifo_armed_rx_pack(struct spi_stm32_data *data)
 static inline void spi_stm32_fifo_rx_set_threshold(SPI_TypeDef *spi, struct spi_stm32_data *data,
 						    bool can_pack)
 {
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) && \
-	!defined(CONFIG_SPI_RTIO)
-	data->armed_rx_pack = spi_stm32_fifo_pack(data, can_pack);
-	LL_SPI_SetRxFIFOThreshold(spi, (data->armed_rx_pack == 2U)
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	if (!IS_ENABLED(CONFIG_SPI_RTIO) || data->fifo_packing) {
+		data->armed_rx_pack = spi_stm32_fifo_pack(data, can_pack);
+		LL_SPI_SetRxFIFOThreshold(spi, (data->armed_rx_pack == 2U)
 					       ? LL_SPI_RX_FIFO_TH_HALF
 					       : LL_SPI_RX_FIFO_TH_QUARTER);
+	}
 #else
 	ARG_UNUSED(spi);
 	ARG_UNUSED(data);
@@ -635,8 +636,15 @@ static inline void spi_stm32_fifo_rx_set_threshold(SPI_TypeDef *spi, struct spi_
 #endif
 }
 
-static uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi, struct spi_stm32_data *data,
-					 uint8_t fifo_space)
+#if defined(CONFIG_SPI_RTIO) && DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && \
+	!DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+static bool spi_stm32_iodev_can_chain(struct spi_stm32_data *data);
+static void spi_stm32_iodev_chain_txrx(SPI_TypeDef *spi, struct spi_stm32_data *data,
+					       struct rtio_iodev_sqe *next);
+#endif /* CONFIG_SPI_RTIO && st_stm32_spi_fifo && !st_stm32h7_spi */
+
+static ALWAYS_INLINE uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi,
+						struct spi_stm32_data *data, uint8_t fifo_space)
 {
 	const uint8_t dfs = data->dfs;
 	uint32_t tx_frame = SPI_STM32_TX_NOP;
@@ -685,8 +693,8 @@ static uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi, struct spi_stm32_data
 	return len;
 }
 
-static uint8_t spi_stm32_read_next_frame(SPI_TypeDef *spi, struct spi_stm32_data *data,
-					 uint8_t fifo_space)
+static ALWAYS_INLINE uint8_t spi_stm32_read_next_frame(SPI_TypeDef *spi,
+						struct spi_stm32_data *data, uint8_t fifo_space)
 {
 	const uint8_t dfs = data->dfs;
 	uint32_t rx_frame = 0;
@@ -871,6 +879,14 @@ static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *dat
 									     tx_can_pack &&
 									     rx_can_pack));
 				} else {
+#if defined(CONFIG_SPI_RTIO) && DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && \
+	!DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+					if (data->fifo_packing && spi_stm32_iodev_can_chain(data)) {
+						spi_stm32_iodev_chain_txrx(spi, data,
+							rtio_txn_next(data->rtio_ctx->txn_curr));
+						return 0;
+					}
+#endif /* CONFIG_SPI_RTIO && st_stm32_spi_fifo && !st_stm32h7_spi */
 					spi_stm32_fifo_rx_set_threshold(spi, data,
 							spi_stm32_fifo_rx_can_pack(data));
 					/* All TX done; request one trailing TXE interrupt
@@ -1253,6 +1269,43 @@ static int32_t spi_stm32_set_transfer_size(const struct device *dev,
 					   const struct spi_buf_set *tx_bufs,
 					   const struct spi_buf_set *rx_bufs);
 
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+static bool spi_stm32_iodev_can_chain(struct spi_stm32_data *data)
+{
+	struct rtio_iodev_sqe *current = data->rtio_ctx->txn_curr;
+	struct rtio_iodev_sqe *next = rtio_txn_next(current);
+
+	return next != NULL && current->sqe.op == RTIO_OP_TXRX &&
+		next->sqe.op == RTIO_OP_TXRX && next->sqe.iodev == current->sqe.iodev;
+}
+
+static void spi_stm32_iodev_chain_txrx(SPI_TypeDef *spi, struct spi_stm32_data *data,
+					       struct rtio_iodev_sqe *next)
+{
+	const uint32_t size = next->sqe.txrx.buf_len / data->dfs;
+
+	data->rtio_ctx->txn_curr = next;
+	data->ctx.current_tx = NULL;
+	data->ctx.current_rx = NULL;
+	data->ctx.tx_buf = next->sqe.txrx.tx_buf;
+	data->ctx.rx_buf = next->sqe.txrx.rx_buf;
+	data->ctx.tx_len = size;
+	data->ctx.rx_len = size;
+	data->ctx.tx_count = 1U;
+	data->ctx.rx_count = 1U;
+	data->tx_len = size;
+	data->rx_len = size;
+	data->fifo_packing = true;
+
+	bool tx_can_pack = spi_stm32_fifo_tx_can_pack(data);
+	bool rx_can_pack = spi_stm32_fifo_rx_can_pack(data);
+
+	data->tx_len -= spi_stm32_send_next_frame(spi, data,
+			spi_stm32_fifo_pack(data, tx_can_pack && rx_can_pack));
+	spi_stm32_fifo_rx_set_threshold(spi, data, tx_can_pack && rx_can_pack);
+}
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
+
 static void spi_stm32_iodev_msg_start(const struct device *dev, struct spi_config *config,
 				      const uint8_t *tx_buf, uint8_t *rx_buf, uint32_t buf_len)
 {
@@ -1283,6 +1336,10 @@ static void spi_stm32_iodev_msg_start(const struct device *dev, struct spi_confi
 
 	data->ctx.sync_status = 0;
 	data->ctx.owner = config;
+
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	data->fifo_packing = spi_stm32_iodev_can_chain(data);
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
 
 	if (!spi_stm32_transfer_ongoing(data)) {
 		spi_stm32_iodev_complete(dev, 0);
@@ -1405,11 +1462,31 @@ static inline int spi_stm32_iodev_prepare_start(const struct device *dev)
 
 static void spi_stm32_iodev_complete(const struct device *dev, int status)
 {
+	const struct spi_stm32_config *cfg = dev->config;
 	struct spi_stm32_data *data = dev->data;
 	struct spi_rtio *rtio_ctx = data->rtio_ctx;
+	struct rtio_iodev_sqe *next;
+	bool use_dma = false;
+
+#if defined(CONFIG_SPI_STM32_DMA)
+	use_dma = (data->dma_tx.dma_dev != NULL) && (data->dma_rx.dma_dev != NULL);
+#endif /* CONFIG_SPI_STM32_DMA */
 
 	if (status == 0 && (rtio_ctx->txn_curr->sqe.flags & RTIO_SQE_TRANSACTION) != 0) {
-		rtio_ctx->txn_curr = rtio_txn_next(rtio_ctx->txn_curr);
+		next = rtio_txn_next(rtio_ctx->txn_curr);
+
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+		if (!use_dma && LL_SPI_GetMode(cfg->spi) == LL_SPI_MODE_MASTER &&
+		    spi_stm32_iodev_can_chain(data)) {
+			spi_stm32_iodev_chain_txrx(cfg->spi, data, next);
+			return;
+		}
+#else
+		ARG_UNUSED(use_dma);
+		ARG_UNUSED(cfg);
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
+
+		rtio_ctx->txn_curr = next;
 		spi_stm32_iodev_start(dev);
 	} else {
 		spi_stm32_cs_control(dev, false);
@@ -2383,9 +2460,9 @@ static int transceive(const struct device *dev,
 	ll_disable_int_dxp(spi);
 	ll_disable_int_eot(spi);
 
-#ifdef CONFIG_SPI_RTIO
+	#ifdef CONFIG_SPI_RTIO
 	ret = spi_rtio_transceive(data->rtio_ctx, config, tx_bufs, rx_bufs);
-#else /* CONFIG_SPI_RTIO */
+	#else /* CONFIG_SPI_RTIO */
 	ret = spi_stm32_configure(dev, config, tx_bufs != NULL, rx_bufs != NULL);
 	if (ret != 0) {
 		goto end;
@@ -2407,7 +2484,7 @@ static int transceive(const struct device *dev,
 	}
 	LL_SPI_ClearFlag_OVR(spi);
 
-#ifdef CONFIG_SPI_STM32_DMA
+	#ifdef CONFIG_SPI_STM32_DMA
 	if (use_dma) {
 		ret = transceive_dma(dev, config);
 		goto end;
@@ -2446,7 +2523,7 @@ static int transceive(const struct device *dev,
 	}
 
 end:
-#endif /* CONFIG_SPI_RTIO */
+	#endif /* CONFIG_SPI_RTIO */
 	if (ret != 0 || !asynchronous || IS_ENABLED(CONFIG_SPI_RTIO)) {
 		spi_stm32_pm_policy_state_lock_put(dev);
 	}

@@ -78,6 +78,9 @@ struct spi_stm32_data {
 	uint8_t fifo_threshold; /* Threshold value (in number of data frames) */
 	uint8_t dfs; /* Bytes per frame, cached from ctx.config->operation at configure time */
 	uint8_t armed_rx_pack; /* Rx pack width matching the currently armed FRXTH */
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	bool fifo_packing;
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
 #ifdef CONFIG_SPI_STM32_DMA
 	struct k_sem status_sem;
 	volatile uint32_t status_flags;
