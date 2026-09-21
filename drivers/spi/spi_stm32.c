@@ -588,7 +588,8 @@ static inline bool spi_stm32_fifo_tx_can_pack(struct spi_stm32_data *data)
  */
 static inline uint8_t spi_stm32_fifo_pack(struct spi_stm32_data *data, bool can_pack)
 {
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) && \
+	!defined(CONFIG_SPI_RTIO)
 	return (data->dfs == 1U && can_pack) ? 2U : 1U;
 #else
 	ARG_UNUSED(data);
@@ -604,7 +605,8 @@ static inline uint8_t spi_stm32_fifo_pack(struct spi_stm32_data *data, bool can_
  */
 static inline uint8_t spi_stm32_fifo_armed_rx_pack(struct spi_stm32_data *data)
 {
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) && \
+	!defined(CONFIG_SPI_RTIO)
 	return data->armed_rx_pack;
 #else
 	ARG_UNUSED(data);
@@ -620,7 +622,8 @@ static inline uint8_t spi_stm32_fifo_armed_rx_pack(struct spi_stm32_data *data)
 static inline void spi_stm32_fifo_rx_set_threshold(SPI_TypeDef *spi, struct spi_stm32_data *data,
 						    bool can_pack)
 {
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) && \
+	!defined(CONFIG_SPI_RTIO)
 	data->armed_rx_pack = spi_stm32_fifo_pack(data, can_pack);
 	LL_SPI_SetRxFIFOThreshold(spi, (data->armed_rx_pack == 2U)
 					       ? LL_SPI_RX_FIFO_TH_HALF
@@ -1146,7 +1149,7 @@ static void spi_stm32_msg_start(const struct device *dev, bool is_rx_empty)
 			struct spi_stm32_data *data = dev->data;
 			bool classic_fifo_peripheral = LL_SPI_GetMode(spi) == LL_SPI_MODE_SLAVE &&
 				DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) &&
-				!DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi);
+				!DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) && !IS_ENABLED(CONFIG_SPI_RTIO);
 
 			if (ll_get_transfer_size(spi) != 0U) {
 #if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
