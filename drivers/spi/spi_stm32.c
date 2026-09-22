@@ -1934,6 +1934,17 @@ static int spi_stm32_configure(const struct device *dev,
 		uint8_t dfs = DIV_ROUND_UP(SPI_WORD_SIZE_GET(config->operation), 8U);
 
 		data->fifo_threshold = MAX(1, cfg->fifo_byte_threshold / dfs);
+
+		if (((cfg->fifo_size == 8U) && (SPI_WORD_SIZE_GET(config->operation) == 9U)) ||
+		    (SPI_WORD_SIZE_GET(config->operation) == 25U)) {
+			/* Workaround for specific combinations of FIFO size and word size:
+			 * For 9-bit words with 8-byte FIFO, limit the FIFO threshold to 3.
+			 * For 25-bit words, also limit the FIFO threshold to 3.
+			 * Otherwise if the threshold is configured to 4, the IP only sends 3
+			 * frames and the driver gets stuck waiting for a DXP that never happens.
+			 */
+			data->fifo_threshold = MIN(data->fifo_threshold, 3U);
+		}
 	} else {
 		/* When using DMA, set the threshold to 1. A higher value doesn't bring better
 		 * performance, and is complicated to handle without using the TSIZE register.
