@@ -559,10 +559,86 @@ static void spi_stm32_dma_rx_done(const struct device *dev, const struct spi_con
 /* Value to shift out when no application data needs transmitting. */
 #define SPI_STM32_TX_NOP 0x00
 
-static uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi, struct spi_stm32_data *data,
-					 uint8_t fifo_space)
+/* Whether the next Rx access can safely pack 2 frames into a single 16-bit DR
+ * read: either at least 2 real frames remain in the current Rx buffer chunk, or
+ * there is no Rx buffer chunk at all (ctx.rx_count == 0, e.g. a null rx_bufs on
+ * an otherwise real transfer), in which case fall back to the driver's own wire
+ * frame count (data->rx_len): ctx doesn't track anything meaningful for a null
+ * buffer, but data->rx_len still does, and packing past it would shift more
+ * bytes onto the wire than the transfer actually needs.
+ */
+static inline bool spi_stm32_fifo_rx_can_pack(struct spi_stm32_data *data)
 {
-	const uint8_t dfs = bits2bytes(data->ctx.config->operation);
+	if (data->ctx.rx_count != 0U) {
+		return data->ctx.rx_len >= 2U;
+	}
+	return data->rx_len >= 2U;
+}
+
+static inline bool spi_stm32_fifo_tx_can_pack(struct spi_stm32_data *data)
+{
+	if (data->ctx.tx_count != 0U) {
+		return data->ctx.tx_len >= 2U;
+	}
+	return data->tx_len >= 2U;
+}
+
+/* Single point that decides the pack width for the next access and keeps FRXTH
+ * matched: derive can_pack from the cached transfer direction (full duplex needs
+ * both sides to agree, half duplex only its own side), store it in
+ * data->armed_rx_pack, and set FRXTH to half-word while packing 2 frames, back
+ * to its 1-byte reset value otherwise so RXNE still fires on a lone trailing
+ * frame. Send/read just consume data->armed_rx_pack. Must be called before the
+ * access it is meant to gate.
+ */
+static inline void spi_stm32_fifo_rx_set_threshold(SPI_TypeDef *spi, struct spi_stm32_data *data)
+{
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	if (IS_ENABLED(CONFIG_SPI_RTIO) && !data->fifo_packing) {
+		return;
+	}
+
+	bool can_pack;
+
+	if (data->xfer_dir == STM32_SPI_FULL_DUPLEX) {
+		can_pack = spi_stm32_fifo_tx_can_pack(data) && spi_stm32_fifo_rx_can_pack(data);
+	} else if (data->xfer_dir == STM32_SPI_HALF_DUPLEX_TX) {
+		can_pack = spi_stm32_fifo_tx_can_pack(data);
+	} else if (data->xfer_dir == STM32_SPI_HALF_DUPLEX_RX) {
+		can_pack = spi_stm32_fifo_rx_can_pack(data);
+	} else {
+		can_pack = false;
+	}
+
+	/* Whether the next Tx/Rx access can pack 2 frames into a single 16-bit DR access:
+	 * only possible for <=8-bit frames, on classic (non st_stm32h7_spi) FIFO series.
+	 */
+	uint8_t pack = ((!IS_ENABLED(CONFIG_SPI_RTIO) || data->fifo_packing)
+			&& data->dfs == 1U && can_pack) ? 2U : 1U;
+
+	if (pack != data->armed_rx_pack) {
+		data->armed_rx_pack = pack;
+		LL_SPI_SetRxFIFOThreshold(spi, (pack == 2U)
+					       ? LL_SPI_RX_FIFO_TH_HALF
+					       : LL_SPI_RX_FIFO_TH_QUARTER);
+	}
+#else
+	ARG_UNUSED(spi);
+	ARG_UNUSED(data);
+#endif
+}
+
+#if defined(CONFIG_SPI_RTIO) && DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && \
+	!DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+static bool spi_stm32_iodev_can_chain(struct spi_stm32_data *data);
+static void spi_stm32_iodev_chain_txrx(SPI_TypeDef *spi, struct spi_stm32_data *data,
+					       struct rtio_iodev_sqe *next);
+#endif /* CONFIG_SPI_RTIO && st_stm32_spi_fifo && !st_stm32h7_spi */
+
+static ALWAYS_INLINE uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi,
+						struct spi_stm32_data *data, uint8_t fifo_space)
+{
+	const uint8_t dfs = data->dfs;
 	uint32_t tx_frame = SPI_STM32_TX_NOP;
 	uint8_t len;
 
@@ -577,8 +653,16 @@ static uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi, struct spi_stm32_data
 		len = 4U / dfs;
 	} else {
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
+		/* The count==0 (no real buffer) bypass below only applies to the classic
+		 * (non-H7) FIFO series: H7's TSIZE/DXP-driven fifo_threshold loop does not
+		 * need it, and enabling it there regressed real H7-style HW (null buffers).
+		 */
 		if (dfs == 2U ||
-		    (dfs == 1U && fifo_space >= 2U && data->ctx.tx_len >= 2)) {
+		    (dfs == 1U && fifo_space >= 2U &&
+		     (data->ctx.tx_len >= 2 ||
+		      (DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) &&
+		       !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) &&
+		       data->ctx.tx_count == 0)))) {
 			if (spi_context_tx_buf_on(&data->ctx)) {
 				tx_frame = UNALIGNED_GET((uint16_t *)(data->ctx.tx_buf));
 			}
@@ -601,10 +685,10 @@ static uint8_t spi_stm32_send_next_frame(SPI_TypeDef *spi, struct spi_stm32_data
 	return len;
 }
 
-static uint8_t spi_stm32_read_next_frame(SPI_TypeDef *spi, struct spi_stm32_data *data,
-					 uint8_t fifo_space)
+static ALWAYS_INLINE uint8_t spi_stm32_read_next_frame(SPI_TypeDef *spi,
+						struct spi_stm32_data *data, uint8_t fifo_space)
 {
-	const uint8_t dfs = bits2bytes(data->ctx.config->operation);
+	const uint8_t dfs = data->dfs;
 	uint32_t rx_frame = 0;
 	uint8_t len;
 
@@ -619,8 +703,15 @@ static uint8_t spi_stm32_read_next_frame(SPI_TypeDef *spi, struct spi_stm32_data
 		len = 4U / dfs;
 	} else {
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
+		/* See the matching comment in spi_stm32_send_next_frame: the count==0
+		 * bypass is classic-FIFO-series only, not H7.
+		 */
 		if (dfs == 2U ||
-		    (dfs == 1U && fifo_space >= 2U && data->ctx.rx_len >= 2)) {
+		    (dfs == 1U && fifo_space >= 2U &&
+		     (data->ctx.rx_len >= 2 ||
+		      (DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) &&
+		       !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) &&
+		       data->ctx.rx_count == 0)))) {
 			rx_frame = LL_SPI_ReceiveData16(spi);
 			if (spi_context_rx_buf_on(&data->ctx)) {
 				UNALIGNED_PUT(rx_frame, (uint16_t *)data->ctx.rx_buf);
@@ -739,31 +830,40 @@ static int spi_stm32_shift_fifo(SPI_TypeDef *spi, struct spi_stm32_data *data)
 }
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
 
-/* Shift a SPI frame as controller. */
-static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+/* Classic FIFO series (FRXTH-threshold-driven, software-tracked packing).
+ * Only ever called with ll_get_transfer_size(spi) == 0 (no TSIZE on this
+ * series), so every access here goes through the FRXTH/RXNE machinery below.
+ */
+static int spi_stm32_shift_m_packed(SPI_TypeDef *spi, struct spi_stm32_data *data)
 {
-#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
-	if (ll_get_transfer_size(spi) > 0U) {
-		/* Transfer size is set, use FIFO mode. */
-		return spi_stm32_shift_fifo(spi, data);
-	}
-#endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
-
 	uint32_t dir = ll_get_transfer_direction(spi);
 
 	if (IS_ENABLED(CONFIG_SPI_STM32_INTERRUPT)) {
 		if (dir == STM32_SPI_FULL_DUPLEX) {
-			/* RXNE-driven: TXE interrupt is not enabled for this path.
-			 * Read the received frame, then queue the next TX frame to keep
-			 * the one-frame pipeline full.
-			 * After the last TX frame, re-enable TXE so the trailing TXE ISR
-			 * provides a guaranteed exit point once BSY has cleared.
+			/* RXNE-driven: read what came back using the currently armed pack,
+			 * re-arm (which decides the next pack), then requeue the same amount
+			 * of TX so FRXTH and the actual access width stay matched. The send
+			 * is the only thing that produces more Rx bytes before the next
+			 * event, so the pack just armed describes exactly what will arrive.
 			 */
 			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
-				data->rx_len -= spi_stm32_read_next_frame(spi, data, 0U);
+				data->rx_len -= spi_stm32_read_next_frame(spi, data,
+						data->armed_rx_pack);
+
 				if (data->tx_len != 0U) {
-					data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+					spi_stm32_fifo_rx_set_threshold(spi, data);
+					data->tx_len -= spi_stm32_send_next_frame(spi, data,
+							data->armed_rx_pack);
 				} else {
+#if defined(CONFIG_SPI_RTIO)
+					if (data->fifo_packing && spi_stm32_iodev_can_chain(data)) {
+						spi_stm32_iodev_chain_txrx(spi, data,
+							rtio_txn_next(data->rtio_ctx->txn_curr));
+						return 0;
+					}
+#endif /* CONFIG_SPI_RTIO */
+					spi_stm32_fifo_rx_set_threshold(spi, data);
 					/* All TX done; request one trailing TXE interrupt
 					 * to exit cleanly once BSY is cleared.
 					 */
@@ -773,35 +873,131 @@ static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
 		} else if (dir == STM32_SPI_HALF_DUPLEX_TX) {
 			/* Half-duplex TX: TXE flag-based handling. */
 			if (ll_tx_is_not_full(spi) && data->tx_len != 0U) {
-				data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+				spi_stm32_fifo_rx_set_threshold(spi, data);
+				data->tx_len -= spi_stm32_send_next_frame(spi, data,
+						data->armed_rx_pack);
 			}
 		} else if (dir == STM32_SPI_HALF_DUPLEX_RX) {
 			/* Half-duplex RX: RXNE flag-based handling. */
 			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
-				data->rx_len -= spi_stm32_read_next_frame(spi, data, 0U);
+				data->rx_len -= spi_stm32_read_next_frame(spi, data,
+						data->armed_rx_pack);
+				spi_stm32_fifo_rx_set_threshold(spi, data);
 			}
 		} else {
 			/* Unexpected transfer direction */
 			return -EINVAL;
 		}
 	} else { /* CONFIG_SPI_STM32_INTERRUPT */
-		/* Polling case */
+		/* Polling case: drain Rx before filling Tx (a real FIFO could otherwise
+		 * stall on Tx room while unread Rx data overruns). Every access uses
+		 * data->armed_rx_pack, re-armed once per direction below.
+		 */
+		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
+			while (!ll_rx_is_not_empty(spi)) {
+				/* NOP */
+			}
+			data->rx_len -= spi_stm32_read_next_frame(spi, data,
+					data->armed_rx_pack);
+		}
+
+		if (dir != STM32_SPI_HALF_DUPLEX_RX && data->tx_len != 0U) {
+			/* Re-arm before the send: in full duplex this same pack also gates
+			 * the next Rx read, since the send produces exactly those frames.
+			 */
+			spi_stm32_fifo_rx_set_threshold(spi, data);
+
+			while (!ll_tx_is_not_full(spi)) {
+				/* NOP */
+			}
+			data->tx_len -= spi_stm32_send_next_frame(spi, data,
+					data->armed_rx_pack);
+		} else if (dir == STM32_SPI_HALF_DUPLEX_RX && data->rx_len != 0U) {
+			/* No send to re-arm here; arm for the next Rx read. */
+			spi_stm32_fifo_rx_set_threshold(spi, data);
+		}
+	} /* CONFIG_SPI_STM32_INTERRUPT */
+
+	return 0;
+}
+#else
+/* No FIFO on this series, or H7 falling back to its TSIZE == 0, no-FIFO
+ * software path for oversized buffers: always a single frame (or one native
+ * 16-bit word) per access, no packing, no FIFO threshold to manage.
+ */
+static int spi_stm32_shift_m_plain(SPI_TypeDef *spi, struct spi_stm32_data *data)
+{
+	uint32_t dir = ll_get_transfer_direction(spi);
+
+	if (IS_ENABLED(CONFIG_SPI_STM32_INTERRUPT)) {
+		if (dir == STM32_SPI_FULL_DUPLEX) {
+			/* RXNE-driven, seeded by one Tx frame in spi_stm32_msg_start:
+			 * read what came back, then requeue a single matching frame.
+			 */
+			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
+				data->rx_len -= spi_stm32_read_next_frame(spi, data, 1U);
+				if (data->tx_len != 0U) {
+					data->tx_len -= spi_stm32_send_next_frame(spi, data, 1U);
+				} else {
+					/* All TX done; request one trailing TXE interrupt
+					 * to exit cleanly once BSY is cleared.
+					 */
+					ll_enable_int_tx_empty(spi);
+				}
+			}
+		} else if (dir == STM32_SPI_HALF_DUPLEX_TX) {
+			if (ll_tx_is_not_full(spi) && data->tx_len != 0U) {
+				data->tx_len -= spi_stm32_send_next_frame(spi, data, 1U);
+			}
+		} else if (dir == STM32_SPI_HALF_DUPLEX_RX) {
+			if (ll_rx_is_not_empty(spi) && data->rx_len != 0U) {
+				data->rx_len -= spi_stm32_read_next_frame(spi, data, 1U);
+			}
+		} else {
+			/* Unexpected transfer direction */
+			return -EINVAL;
+		}
+	} else { /* CONFIG_SPI_STM32_INTERRUPT */
+		/* Polling case: send before read. There is no FIFO to overrun, and
+		 * sending first is what primes the clock for the very first frame
+		 * (no seed is done for this path in spi_stm32_msg_start).
+		 */
 		if (dir != STM32_SPI_HALF_DUPLEX_RX && data->tx_len != 0U) {
 			while (!ll_tx_is_not_full(spi)) {
 				/* NOP */
 			}
-			data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+			data->tx_len -= spi_stm32_send_next_frame(spi, data, 1U);
 		}
 
 		if (dir != STM32_SPI_HALF_DUPLEX_TX && data->rx_len != 0U) {
 			while (!ll_rx_is_not_empty(spi)) {
 				/* NOP */
 			}
-			data->rx_len -= spi_stm32_read_next_frame(spi, data, 0U);
+			data->rx_len -= spi_stm32_read_next_frame(spi, data, 1U);
 		}
 	} /* CONFIG_SPI_STM32_INTERRUPT */
 
 	return 0;
+}
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
+
+/* Shift a SPI frame as controller: dispatches to the implementation matching
+ * this instance's FIFO capability, decided once at compile time.
+ */
+static int spi_stm32_shift_m(SPI_TypeDef *spi, struct spi_stm32_data *data)
+{
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	if (ll_get_transfer_size(spi) > 0U) {
+		/* Transfer size is set, use FIFO mode. */
+		return spi_stm32_shift_fifo(spi, data);
+	}
+#endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
+
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	return spi_stm32_shift_m_packed(spi, data);
+#else
+	return spi_stm32_shift_m_plain(spi, data);
+#endif
 }
 
 /* Shift a SPI frame as peripheral. */
@@ -876,6 +1072,10 @@ static void spi_stm32_msg_start(const struct device *dev, bool is_rx_empty)
 
 	ARG_UNUSED(is_rx_empty);
 
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	((struct spi_stm32_data *)dev->data)->xfer_dir = transfer_dir;
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
+
 #if defined(CONFIG_SPI_STM32_INTERRUPT) && defined(CONFIG_SOC_SERIES_STM32H7X)
 	/* Make sure IRQ is disabled to avoid any spurious IRQ to happen */
 	irq_disable(cfg->irq_line);
@@ -913,10 +1113,14 @@ static void spi_stm32_msg_start(const struct device *dev, bool is_rx_empty)
 	spi_stm32_cs_control(dev, true);
 
 	if (IS_ENABLED(CONFIG_SPI_STM32_INTERRUPT)) {
+		struct spi_stm32_data *data = dev->data;
+
 		ll_enable_int_errors(spi);
 
 		if (transfer_dir == STM32_SPI_FULL_DUPLEX) {
-			struct spi_stm32_data *data = dev->data;
+			bool classic_fifo_peripheral = LL_SPI_GetMode(spi) == LL_SPI_MODE_SLAVE &&
+				DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) &&
+				!DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) && !IS_ENABLED(CONFIG_SPI_RTIO);
 
 			if (ll_get_transfer_size(spi) != 0U) {
 #if DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
@@ -929,23 +1133,38 @@ static void spi_stm32_msg_start(const struct device *dev, bool is_rx_empty)
 				ll_enable_int_dxp(spi);
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
 			} else {
-				/* Non-H7 or H7 without FIFO full-duplex:
-				 * Seed the TX pipeline with the first frame and enable RXNE only.
-				 * Each RXNE ISR reads one received frame then sends the next,
-				 * keeping exactly one frame in flight.
-				 * This eliminates RX overrun without busy-waiting in ISR context.
-				 */
-				data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+				if (classic_fifo_peripheral) {
+					data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+					if (data->tx_len != 0U) {
+						/* The controller's initial packed write clocks two frames
+						 * before the peripheral TXE interrupt can refill DR.
+						 */
+						data->tx_len -= spi_stm32_send_next_frame(spi, data, 0U);
+					}
+				} else {
+					/* Seed the TX pipeline, arming the pack width for the
+					 * first Rx event, then enable RXNE only.
+					 */
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && \
+	!DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+					spi_stm32_fifo_rx_set_threshold(spi, data);
+					data->tx_len -= spi_stm32_send_next_frame(spi, data,
+							data->armed_rx_pack);
+#else
+					data->tx_len -= spi_stm32_send_next_frame(spi, data, 1U);
+#endif
+				}
 				ll_enable_int_rx_not_empty(spi);
 			}
-		} else {
-			if (transfer_dir != STM32_SPI_HALF_DUPLEX_TX) {
-				ll_enable_int_rx_not_empty(spi);
+		} else if (transfer_dir == STM32_SPI_HALF_DUPLEX_RX) {
+			if (LL_SPI_GetMode(spi) != LL_SPI_MODE_SLAVE ||
+				!DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) ||
+				DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)) {
+				spi_stm32_fifo_rx_set_threshold(spi, data);
 			}
-
-			if (transfer_dir != STM32_SPI_HALF_DUPLEX_RX) {
-				ll_enable_int_tx_empty(spi);
-			}
+			ll_enable_int_rx_not_empty(spi);
+		} else if (transfer_dir == STM32_SPI_HALF_DUPLEX_TX) {
+			ll_enable_int_tx_empty(spi);
 		}
 
 		if (ll_get_transfer_size(spi) != 0U) {
@@ -967,6 +1186,19 @@ static void spi_stm32_msg_start(const struct device *dev, bool is_rx_empty)
 
 			spi_stm32_send_fifo(spi, data);
 		}
+#elif DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo)
+		if (transfer_dir == STM32_SPI_FULL_DUPLEX &&
+		    LL_SPI_GetMode(spi) == LL_SPI_MODE_MASTER) {
+			/* Polling mode: seed the TX pipeline so the shift_m loop can read
+			 * before it sends on its very first iteration, then arm the Rx
+			 * threshold using the post-decrement ctx.tx_len (see the IT seed
+			 * above for why the ordering matters).
+			 */
+			struct spi_stm32_data *data = dev->data;
+
+			spi_stm32_fifo_rx_set_threshold(spi, data);
+			data->tx_len -= spi_stm32_send_next_frame(spi, data, data->armed_rx_pack);
+		}
 #endif /* DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi) */
 	}
 }
@@ -982,11 +1214,50 @@ static int32_t spi_stm32_set_transfer_size(const struct device *dev,
 					   const struct spi_buf_set *tx_bufs,
 					   const struct spi_buf_set *rx_bufs);
 
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+static bool spi_stm32_iodev_can_chain(struct spi_stm32_data *data)
+{
+	struct rtio_iodev_sqe *current = data->rtio_ctx->txn_curr;
+	struct rtio_iodev_sqe *next = rtio_txn_next(current);
+
+	/* Chaining packs frames and re-arms FRXTH, which only the controller path does;
+	 * it also bypasses the normal buf_len validation, so reject lengths that are zero
+	 * or not a multiple of dfs to avoid an unsigned underflow in the send path.
+	 */
+	return SPI_OP_MODE_GET(data->ctx.config->operation) == SPI_OP_MODE_CONTROLLER &&
+		next != NULL && current->sqe.op == RTIO_OP_TXRX &&
+		next->sqe.op == RTIO_OP_TXRX && next->sqe.iodev == current->sqe.iodev &&
+		next->sqe.txrx.buf_len != 0U && (next->sqe.txrx.buf_len % data->dfs) == 0U;
+}
+
+static void spi_stm32_iodev_chain_txrx(SPI_TypeDef *spi, struct spi_stm32_data *data,
+					       struct rtio_iodev_sqe *next)
+{
+	const uint32_t size = next->sqe.txrx.buf_len / data->dfs;
+
+	data->rtio_ctx->txn_curr = next;
+	data->ctx.current_tx = NULL;
+	data->ctx.current_rx = NULL;
+	data->ctx.tx_buf = next->sqe.txrx.tx_buf;
+	data->ctx.rx_buf = next->sqe.txrx.rx_buf;
+	data->ctx.tx_len = size;
+	data->ctx.rx_len = size;
+	data->ctx.tx_count = 1U;
+	data->ctx.rx_count = 1U;
+	data->tx_len = size;
+	data->rx_len = size;
+	data->fifo_packing = true;
+
+	spi_stm32_fifo_rx_set_threshold(spi, data);
+	data->tx_len -= spi_stm32_send_next_frame(spi, data, data->armed_rx_pack);
+}
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
+
 static void spi_stm32_iodev_msg_start(const struct device *dev, struct spi_config *config,
 				      const uint8_t *tx_buf, uint8_t *rx_buf, uint32_t buf_len)
 {
 	struct spi_stm32_data *data = dev->data;
-	const uint8_t dfs = bits2bytes(config->operation);
+	const uint8_t dfs = data->dfs;
 	const uint32_t size = buf_len / dfs;
 	bool use_dma = false;
 
@@ -1012,6 +1283,10 @@ static void spi_stm32_iodev_msg_start(const struct device *dev, struct spi_confi
 
 	data->ctx.sync_status = 0;
 	data->ctx.owner = config;
+
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+	data->fifo_packing = spi_stm32_iodev_can_chain(data);
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
 
 	if (!spi_stm32_transfer_ongoing(data)) {
 		spi_stm32_iodev_complete(dev, 0);
@@ -1134,11 +1409,30 @@ static inline int spi_stm32_iodev_prepare_start(const struct device *dev)
 
 static void spi_stm32_iodev_complete(const struct device *dev, int status)
 {
+	const struct spi_stm32_config *cfg = dev->config;
 	struct spi_stm32_data *data = dev->data;
 	struct spi_rtio *rtio_ctx = data->rtio_ctx;
+	struct rtio_iodev_sqe *next;
+	bool use_dma = false;
+
+#if defined(CONFIG_SPI_STM32_DMA)
+	use_dma = (data->dma_tx.dma_dev != NULL) && (data->dma_rx.dma_dev != NULL);
+#endif /* CONFIG_SPI_STM32_DMA */
 
 	if (status == 0 && (rtio_ctx->txn_curr->sqe.flags & RTIO_SQE_TRANSACTION) != 0) {
-		rtio_ctx->txn_curr = rtio_txn_next(rtio_ctx->txn_curr);
+		next = rtio_txn_next(rtio_ctx->txn_curr);
+
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+		if (!use_dma && spi_stm32_iodev_can_chain(data)) {
+			spi_stm32_iodev_chain_txrx(cfg->spi, data, next);
+			return;
+		}
+#else
+		ARG_UNUSED(use_dma);
+		ARG_UNUSED(cfg);
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
+
+		rtio_ctx->txn_curr = next;
 		spi_stm32_iodev_start(dev);
 	} else {
 		spi_stm32_cs_control(dev, false);
@@ -1183,6 +1477,13 @@ static int spi_stm32_half_duplex_switch_direction(const struct device *dev)
 		LL_SPI_Disable(spi);
 		ll_set_transfer_size(spi, data->rx_len);
 		ll_set_transfer_direction(spi, STM32_SPI_HALF_DUPLEX_RX);
+#if DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo) && !DT_HAS_COMPAT_STATUS_OKAY(st_stm32h7_spi)
+		/* Re-arm the pack width for the first Rx read: the Tx phase may have left
+		 * armed_rx_pack at a Tx-only value with FRXTH untouched.
+		 */
+		data->xfer_dir = STM32_SPI_HALF_DUPLEX_RX;
+		spi_stm32_fifo_rx_set_threshold(spi, data);
+#endif /* st_stm32_spi_fifo && !st_stm32h7_spi */
 		LL_SPI_Enable(spi);
 		spi_stm32_cs_control(dev, true);
 
@@ -1605,6 +1906,7 @@ static int spi_stm32_configure(const struct device *dev,
 	LL_SPI_SetFIFOThreshold(spi, table_fifo_threshold[data->fifo_threshold - 1]);
 #elif DT_HAS_COMPAT_STATUS_OKAY(st_stm32_spi_fifo)
 	data->fifo_threshold = 1;
+	data->armed_rx_pack = 1U;
 	LL_SPI_SetRxFIFOThreshold(spi, LL_SPI_RX_FIFO_TH_QUARTER);
 #else
 	data->fifo_threshold = 1;
@@ -1612,6 +1914,7 @@ static int spi_stm32_configure(const struct device *dev,
 
 	/* At this point, it's mandatory to set this on the context! */
 	data->ctx.config = config;
+	data->dfs = bits2bytes(config->operation);
 
 	LOG_DBG("Installed config %p: freq %uHz (div = %u), mode %u/%u/%u, peripheral %u",
 		config, clock >> (br + shift), 1 << (br + shift),
